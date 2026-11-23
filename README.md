@@ -1,5 +1,6 @@
 # Seguidor_solar
 ![image alt](https://github.com/anthonyespinoq/Seguidor_solar/blob/c68234477d345443d0931979f9f51512e35491fe/experimental.png)
+
 Prototipo electrónico de un seguidor solar automático que busca optimizar la generación de energía eléctrica mediante la orientación de un panel fotovoltaico hacia la posición de mayor aprovechamiento solar.
 
 ## Descripción general
