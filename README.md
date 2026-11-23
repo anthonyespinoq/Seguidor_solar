@@ -34,7 +34,9 @@ El sistema opera a partir de un microcontrolador **ESP32** como unidad central d
 ## Conexiones y estructura del repositorio
 ![image alt](https://github.com/anthonyespinoq/Seguidor_solar/blob/9bf4837e30a80bd2d61271825b2fc60042c2ba6c/Diagra-seguidorsolar.png)
 
-## Codigo en el SP32:
+## Código del sistema (ESP32)
+
+```cpp
 #include <Arduino.h>
 #include <Wire.h>
 #include <ESP32Servo.h>
@@ -268,4 +270,4 @@ void loop() {
     delay(2500);
   }
 }
-
+```
