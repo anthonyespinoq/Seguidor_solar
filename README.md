@@ -35,4 +35,5 @@ El sistema opera a partir de un microcontrolador **ESP32** como unidad central d
 ![image alt](https://github.com/anthonyespinoq/Seguidor_solar/blob/9bf4837e30a80bd2d61271825b2fc60042c2ba6c/Diagra-seguidorsolar.png)
 
 ## Código del sistema (ESP32)
+Puedes ver el código a través de este enlace
 [Ver código del sistema (ESP32)](https://github.com/anthonyespinoq/Seguidor_solar/blob/647f45a14f7058f9f60c126c077bcbda5d42f826/CODIGO)
