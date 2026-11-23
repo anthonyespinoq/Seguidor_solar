@@ -1,0 +1,237 @@
+## Código del sistema (ESP32)
+
+```cpp
+#include <Arduino.h>
+#include <Wire.h>
+#include <ESP32Servo.h>
+#include <BH1750.h>
+#include <Adafruit_INA219.h>
+#include <math.h>
+
+const int PIN_LDR_IZQ = 34, PIN_LDR_DER = 35, PIN_SERVO = 18;
+const int SDA_PIN = 21, SCL_PIN = 22;
+const int ANG_MIN = 20, ANG_MAX = 160, PASO = 20;
+const int N = (ANG_MAX - ANG_MIN) / PASO + 1;
+const unsigned long INTERVALO_BARRIDO_MS = 60000UL;
+const unsigned long ASENTAMIENTO_MS = 1100;
+const int LECTURAS = 8;
+const double PI_NUM = 3.141592653589793;
+
+Servo servo;
+BH1750 bh1750;
+Adafruit_INA219 ina219(0x40);
+bool bhOK = false, inaOK = false;
+struct Punto { double angulo, potencia; } datos[N];
+int anguloActual = 90;
+unsigned long ultimoBarrido = 0, ultimoTiempoEnergia = 0;
+double potenciaAnterior_W = 0, energia_Wh = 0;
+
+int limitarAngulo(double a) {
+  if (a < ANG_MIN) a = ANG_MIN;
+  if (a > ANG_MAX) a = ANG_MAX;
+  return (int)lround(a);
+}
+void mover(double angulo) {
+  anguloActual = limitarAngulo(angulo);
+  servo.write(anguloActual);
+  delay(ASENTAMIENTO_MS);
+}
+
+// Energia por regla del trapecio aplicada a P(t), en Wh.
+void integrarEnergia(double pW) {
+  unsigned long ahora = millis();
+  if (ultimoTiempoEnergia != 0) {
+    double horas = ((unsigned long)(ahora - ultimoTiempoEnergia)) / 3600000.0;
+    energia_Wh += (potenciaAnterior_W + pW) * 0.5 * horas;
+  }
+  ultimoTiempoEnergia = ahora;
+  potenciaAnterior_W = pW;
+}
+
+// En nuestro cableado VIN+ <- panel+, VIN- -> resistencia -> GND.
+// La tension de la resistencia es la lectura BUS del INA219.
+// Corriente positiva: panel -> carga. P = Vbus * I.
+double medirPotencia() {
+  if (!inaOK) return 0.0;
+  double sumaV = 0, sumaI = 0;
+  for (int k=0; k<LECTURAS; ++k) {
+    sumaV += ina219.getBusVoltage_V();
+    sumaI += ina219.getCurrent_mA();
+    delay(45);
+  }
+  double v = sumaV / LECTURAS;
+  double iA = (sumaI / LECTURAS) / 1000.0;
+  double p = max(0.0, v) * max(0.0, iA);
+  integrarEnergia(p);
+  return p;
+}
+
+// Lagrange de grado 2 usando 3 muestras locales.
+double lagrange(double x, const Punto p[3]) {
+  double y = 0;
+  for (int i=0; i<3; ++i) {
+    double termino = p[i].potencia;
+    for (int j=0; j<3; ++j)
+      if (i != j) termino *= (x-p[j].angulo)/(p[i].angulo-p[j].angulo);
+    y += termino;
+  }
+  return y;
+}
+
+// Newton de grado 2, por diferencias divididas.
+double newtonInterpolacion(double x, const Punto p[3]) {
+  double a0=p[0].potencia;
+  double a1=(p[1].potencia-p[0].potencia)/(p[1].angulo-p[0].angulo);
+  double b1=(p[2].potencia-p[1].potencia)/(p[2].angulo-p[1].angulo);
+  double a2=(b1-a1)/(p[2].angulo-p[0].angulo);
+  return a0+a1*(x-p[0].angulo)+a2*(x-p[0].angulo)*(x-p[1].angulo);
+}
+
+// Derivada de la potencia aproximada con diferencias finitas centrales.
+double derivada(double x, const Punto p[3]) {
+  const double h=0.25; // 0.25 grados
+  return (lagrange(x+h,p)-lagrange(x-h,p))/(2*h);
+}
+
+// Biseccion para buscar una raiz de P'(angulo)=0.
+bool biseccion(double a, double b, const Punto p[3], double &raiz) {
+  double fa=derivada(a,p), fb=derivada(b,p);
+  if (fa*fb>0) return false;
+  for (int it=0; it<45; ++it) {
+    double m=(a+b)/2.0, fm=derivada(m,p);
+    if (fabs(fm)<1e-8 || fabs(b-a)<1e-5) { raiz=m; return true; }
+    if (fa*fm<=0) { b=m; fb=fm; }
+    else { a=m; fa=fm; }
+  }
+  raiz=(a+b)/2.0; return true;
+}
+
+// Newton-Raphson sobre f=P'(angulo); f' se estima numericamente.
+bool newtonRaphson(double x, double a, double b, const Punto p[3], double &raiz) {
+  for (int it=0; it<25; ++it) {
+    double f=derivada(x,p);
+    if (fabs(f)<1e-8) { raiz=x; return true; }
+    double h=0.5;
+    double df=(derivada(x+h,p)-derivada(x-h,p))/(2*h);
+    if (fabs(df)<1e-10) return false;
+    double sig=x-f/df;
+    if (!isfinite(sig) || sig<a || sig>b) return false;
+    if (fabs(sig-x)<1e-5) { raiz=sig; return true; }
+    x=sig;
+  }
+  return false;
+}
+
+// Metodo de la secante sobre P'(angulo)=0.
+bool secante(double x0,double x1,double a,double b,const Punto p[3],double &raiz) {
+  double f0=derivada(x0,p), f1=derivada(x1,p);
+  for (int it=0;it<30;++it) {
+    double denom=f1-f0;
+    if (fabs(denom)<1e-12) return false;
+    double x2=x1-f1*(x1-x0)/denom;
+    if (!isfinite(x2) || x2<a || x2>b) return false;
+    if (fabs(x2-x1)<1e-5 || fabs(derivada(x2,p))<1e-8) {
+      raiz=x2; return true;
+    }
+    x0=x1; f0=f1; x1=x2; f1=derivada(x1,p);
+  }
+  return false;
+}
+
+// Busqueda de MAXIMO por seccion aurea en un modelo unimodal.
+double seccionAurea(double a,double b,const Punto p[3]) {
+  const double q=0.6180339887498949;
+  double c=b-q*(b-a), d=a+q*(b-a);
+  double fc=lagrange(c,p), fd=lagrange(d,p);
+  for (int it=0; it<45 && b-a>0.01; ++it) {
+    if (fc<fd) { a=c; c=d; fc=fd; d=a+q*(b-a); fd=lagrange(d,p); }
+    else { b=d; d=c; fd=fc; c=b-q*(b-a); fc=lagrange(c,p); }
+  }
+  return (a+b)/2.0;
+}
+
+void imprimirMedicion(int ang, double potencia) {
+  Serial.printf("Angulo=%3d deg | Potencia carga=%.5f W | Energia acumulada=%.6f Wh\n",
+                ang,potencia,energia_Wh);
+}
+
+void realizarBarrido() {
+  if (!inaOK) return;
+  Serial.println("\n====== BARRIDO / ANALISIS NUMERICO ======");
+  int ldrI=analogRead(PIN_LDR_IZQ), ldrD=analogRead(PIN_LDR_DER);
+  float lux=bhOK ? bh1750.readLightLevel() : NAN;
+  Serial.printf("LDR izq=%d | LDR der=%d | lux=%.2f\n",ldrI,ldrD,lux);
+  int imax=0;
+  for (int i=0;i<N;++i) {
+    int a=ANG_MIN+i*PASO;
+    mover(a);
+    datos[i]={double(a),medirPotencia()};
+    imprimirMedicion(a,datos[i].potencia);
+    if (datos[i].potencia>datos[imax].potencia) imax=i;
+  }
+  int elegido=(int)datos[imax].angulo;
+  double mejorP=datos[imax].potencia;
+  Serial.printf("Mejor punto MEDIDO: %d deg, %.5f W\n",elegido,mejorP);
+
+  // Interpolacion local solo si el maximo medido no cae en los extremos.
+  if (imax>0 && imax<N-1) {
+    Punto p[3]={datos[imax-1],datos[imax],datos[imax+1]};
+    double a=p[0].angulo,b=p[2].angulo,centro=p[1].angulo;
+    double curvatura=(derivada(centro+1,p)-derivada(centro-1,p))/2.0;
+    Serial.printf("Lagrange(%0.1f)=%.6f W | Newton interpolacion(%0.1f)=%.6f W\n",
+                  centro,lagrange(centro,p),centro,newtonInterpolacion(centro,p));
+    Serial.printf("Diferencias finitas P'(%0.1f)=%.7f W/grado\n",centro,derivada(centro,p));
+    if (curvatura < -1e-10 && derivada(a,p)>0 && derivada(b,p)<0) {
+      double rb=0,rn=0,rs=0;
+      bool okb=biseccion(a,b,p,rb);
+      bool okn=newtonRaphson(centro,a,b,p,rn);
+      bool oks=secante(a,b,a,b,p,rs);
+      double oro=seccionAurea(a,b,p);
+      if(okb) Serial.printf("Biseccion raiz P'=%.3f deg\n",rb);
+      if(okn) Serial.printf("Newton-Raphson raiz P'=%.3f deg\n",rn);
+      if(oks) Serial.printf("Secante raiz P'=%.3f deg\n",rs);
+      Serial.printf("Seccion aurea maximo MODELO=%.3f deg\n",oro);
+      // Validar contra una medida REAL antes de aceptar una prediccion.
+      mover(oro);
+      double prueba=medirPotencia();
+      Serial.printf("Validacion REAL en %d deg = %.5f W\n",anguloActual,prueba);
+      if (prueba > mejorP*1.005) { elegido=anguloActual; mejorP=prueba; }
+    } else {
+      Serial.println("Curva local no presenta maximo interior claro; no se busca raiz.");
+    }
+  } else {
+    Serial.println("Maximo en borde del rango; se mantiene mejor posicion medida.");
+  }
+  mover(elegido);
+  Serial.printf("POSICION FINAL=%d deg | P seleccionada=%.5f W | Energia=%.6f Wh\n",
+                elegido,mejorP,energia_Wh);
+  ultimoBarrido=millis();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  analogReadResolution(12);
+  Wire.begin(SDA_PIN,SCL_PIN);
+  bhOK=bh1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+  inaOK=ina219.begin();
+  servo.setPeriodHertz(50);
+  servo.attach(PIN_SERVO,1000,2000);
+  mover(90);
+  Serial.println("SEGUIDOR SOLAR NUMERICO - SIN WIFI");
+  Serial.printf("BH1750=%s | INA219=%s\n",bhOK?"OK":"NO DETECTADO",inaOK?"OK":"NO DETECTADO");
+  if (!inaOK) Serial.println("ERROR: revise SDA, SCL, alimentacion INA219 y direccion 0x40.");
+  else realizarBarrido();
+}
+void loop() {
+  if (!inaOK) { delay(3000); return; }
+  if ((unsigned long)(millis()-ultimoBarrido)>=INTERVALO_BARRIDO_MS) realizarBarrido();
+  else {
+    // Medidas entre barridos para integrar energia con trapecios.
+    double p=medirPotencia();
+    Serial.printf("Seguimiento: angulo=%d, potencia=%.5f W, E=%.6f Wh, LDR=(%d,%d)\n",
+      anguloActual,p,energia_Wh,analogRead(PIN_LDR_IZQ),analogRead(PIN_LDR_DER));
+    delay(2500);
+  }
+}
+```
